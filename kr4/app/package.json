@@ -1,0 +1,16 @@
+{
+  "name": "kr4-backend",
+  "version": "1.0.0",
+  "description": "Контрольная работа №4 – PostgreSQL, MongoDB, Redis, Nginx, Docker",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "pg": "^8.11.3",
+    "sequelize": "^6.35.2",
+    "mongoose": "^8.0.4",
+    "redis": "^4.6.12"
+  }
+}
