@@ -9,12 +9,12 @@ const SERVER_ID = process.env.SERVER_ID || 'default';
 
 app.use(express.json());
 
-// ---------- Корневой маршрут для проверки ----------
+// ---------- Корневой маршрут ----------
 app.get('/', (req, res) => {
   res.json({ message: 'Balancer is working', server: SERVER_ID });
 });
 
-// ---------- Повторное подключение с retry ----------
+// ---------- Retry подключения ----------
 async function connectWithRetry(connectFn, name, retries = 10, delayMs = 3000) {
   for (let i = 0; i < retries; i++) {
     try {
@@ -29,7 +29,7 @@ async function connectWithRetry(connectFn, name, retries = 10, delayMs = 3000) {
   }
 }
 
-// ---------- PostgreSQL (Sequelize) ----------
+// ---------- PostgreSQL (Практика 19) ----------
 const sequelize = new Sequelize(
   process.env.POSTGRES_DB || 'mydatabase',
   process.env.POSTGRES_USER || 'postgres',
@@ -41,7 +41,6 @@ const sequelize = new Sequelize(
 );
 
 const UserSQL = sequelize.define('User', {
-  id: { type: DataTypes.INTEGER, primaryKey: true, autoIncrement: true },
   first_name: { type: DataTypes.STRING, allowNull: false },
   last_name: { type: DataTypes.STRING, allowNull: false },
   age: { type: DataTypes.INTEGER, allowNull: false },
@@ -52,7 +51,7 @@ const UserSQL = sequelize.define('User', {
   updatedAt: 'updated_at'
 });
 
-// ---------- MongoDB (Mongoose) ----------
+// ---------- MongoDB (Практика 20) — ОСНОВНОЕ ХРАНИЛИЩЕ ДЛЯ ЧТЕНИЯ ----------
 const MONGO_URI = process.env.MONGO_URI || 'mongodb://mongo:27017/usersdb';
 
 async function connectMongo() {
@@ -69,7 +68,7 @@ const userSchema = new mongoose.Schema({
 
 const UserMongo = mongoose.model('User', userSchema);
 
-// ---------- Redis ----------
+// ---------- Redis (Практика 21) ----------
 const redisClient = createClient({
   url: process.env.REDIS_URL || 'redis://redis:6379'
 });
@@ -82,11 +81,13 @@ async function connectRedis() {
 async function cacheMiddleware(req, res, next) {
   try {
     if (!redisClient.isOpen) return next();
-    const key = `users:${req.method}:${req.originalUrl}`;
+    const key = `users:${req.originalUrl}`;
     const cached = await redisClient.get(key);
     if (cached) {
+      console.log(`Cache HIT: ${key}`);
       return res.json({ source: 'cache', server: SERVER_ID, data: JSON.parse(cached) });
     }
+    console.log(`Cache MISS: ${key}`);
     req.cacheKey = key;
     next();
   } catch (err) {
@@ -99,6 +100,7 @@ async function saveToCache(key, data, ttl = 60) {
   try {
     if (!redisClient.isOpen) return;
     await redisClient.set(key, JSON.stringify(data), { EX: ttl });
+    console.log(`Saved to cache: ${key}`);
   } catch (err) {
     console.error('Cache save error:', err);
   }
@@ -108,72 +110,131 @@ async function invalidateUsersCache() {
   try {
     if (!redisClient.isOpen) return;
     const keys = await redisClient.keys('users:*');
-    if (keys.length > 0) await redisClient.del(keys);
+    if (keys.length > 0) {
+      await redisClient.del(keys);
+      console.log(`Cache invalidated: ${keys.length} keys`);
+    }
   } catch (err) {
     console.error('Cache invalidate error:', err);
   }
 }
 
-// ---------- CRUD API ----------
+// ========== CRUD API ==========
+// ЧТЕНИЕ — из MongoDB (Практика 20)
+// ЗАПИСЬ — в PostgreSQL + MongoDB (Практика 19 + 20)
 
-// Создание пользователя
+// POST — Создание (пишем в обе БД)
 app.post('/api/users', async (req, res) => {
   try {
     const { first_name, last_name, age } = req.body;
     if (!first_name || !last_name || !age) {
       return res.status(400).json({ error: 'first_name, last_name, age are required' });
     }
+    // Пишем в PostgreSQL
     const userSQL = await UserSQL.create({ first_name, last_name, age });
-    try { await UserMongo.create({ first_name, last_name, age }); } catch(e) { console.error('Mongo create error:', e.message); }
+    // Пишем в MongoDB (основное хранилище)
+    const userMongo = await UserMongo.create({ first_name, last_name, age });
+    // Связываем ID
+    await UserSQL.update({ mongo_id: userMongo._id.toString() }, { where: { id: userSQL.id } });
     await invalidateUsersCache();
-    res.status(201).json({ source: 'server', server: SERVER_ID, data: userSQL });
+    res.status(201).json({
+      source: 'server',
+      server: SERVER_ID,
+      data: {
+        id: userMongo._id,
+        first_name: userMongo.first_name,
+        last_name: userMongo.last_name,
+        age: userMongo.age,
+        created_at: userMongo.created_at,
+        updated_at: userMongo.updated_at
+      }
+    });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
 
-// Получение всех пользователей (с кэшированием)
+// GET — Список пользователей (из MongoDB + кэш Redis)
 app.get('/api/users', cacheMiddleware, async (req, res) => {
   try {
-    const users = await UserSQL.findAll({ order: [['id', 'ASC']] });
-    await saveToCache(req.cacheKey, users);
-    res.json({ source: 'server', server: SERVER_ID, data: users });
+    const users = await UserMongo.find().sort({ created_at: -1 });
+    const data = users.map(u => ({
+      id: u._id,
+      first_name: u.first_name,
+      last_name: u.last_name,
+      age: u.age,
+      created_at: u.created_at,
+      updated_at: u.updated_at
+    }));
+    await saveToCache(req.cacheKey, data);
+    res.json({ source: 'server', server: SERVER_ID, data });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Получение пользователя по ID (с кэшированием)
+// GET — Пользователь по ID (из MongoDB + кэш Redis)
 app.get('/api/users/:id', cacheMiddleware, async (req, res) => {
   try {
-    const user = await UserSQL.findByPk(req.params.id);
+    const user = await UserMongo.findById(req.params.id);
     if (!user) return res.status(404).json({ error: 'User not found' });
-    await saveToCache(req.cacheKey, user);
-    res.json({ source: 'server', server: SERVER_ID, data: user });
+    const data = {
+      id: user._id,
+      first_name: user.first_name,
+      last_name: user.last_name,
+      age: user.age,
+      created_at: user.created_at,
+      updated_at: user.updated_at
+    };
+    await saveToCache(req.cacheKey, data);
+    res.json({ source: 'server', server: SERVER_ID, data });
   } catch (err) {
     res.status(500).json({ error: err.message });
   }
 });
 
-// Обновление пользователя
+// PATCH — Обновление (MongoDB + PostgreSQL)
 app.patch('/api/users/:id', async (req, res) => {
   try {
-    const userSQL = await UserSQL.findByPk(req.params.id);
-    if (!userSQL) return res.status(404).json({ error: 'User not found' });
-    await userSQL.update(req.body);
+    const userMongo = await UserMongo.findByIdAndUpdate(
+      req.params.id,
+      req.body,
+      { new: true }
+    );
+    if (!userMongo) return res.status(404).json({ error: 'User not found' });
+    // Синхронизируем с PostgreSQL
+    const userSQL = await UserSQL.findOne({ where: { mongo_id: req.params.id } });
+    if (userSQL) {
+      await userSQL.update(req.body);
+    }
     await invalidateUsersCache();
-    res.json({ source: 'server', server: SERVER_ID, data: userSQL });
+    res.json({
+      source: 'server',
+      server: SERVER_ID,
+      data: {
+        id: userMongo._id,
+        first_name: userMongo.first_name,
+        last_name: userMongo.last_name,
+        age: userMongo.age,
+        created_at: userMongo.created_at,
+        updated_at: userMongo.updated_at
+      }
+    });
   } catch (err) {
     res.status(400).json({ error: err.message });
   }
 });
 
-// Удаление пользователя
+// DELETE — Удаление (MongoDB + PostgreSQL)
 app.delete('/api/users/:id', async (req, res) => {
   try {
-    const userSQL = await UserSQL.findByPk(req.params.id);
-    if (!userSQL) return res.status(404).json({ error: 'User not found' });
-    await userSQL.destroy();
+    const userMongo = await UserMongo.findByIdAndDelete(req.params.id);
+    if (!userMongo) return res.status(404).json({ error: 'User not found' });
+    // Удаляем из PostgreSQL
+    const userSQL = await UserSQL.findOne({ where: { mongo_id: req.params.id } });
+    if (userSQL) {
+      await userSQL.destroy();
+    }
     await invalidateUsersCache();
     res.json({ source: 'server', server: SERVER_ID, message: 'User deleted' });
   } catch (err) {
@@ -181,33 +242,36 @@ app.delete('/api/users/:id', async (req, res) => {
   }
 });
 
-// Health-check для Nginx
+// Health-check
 app.get('/health', (req, res) => {
   res.json({ status: 'ok', server: SERVER_ID });
 });
 
-// ---------- Инициализация и запуск ----------
+// ---------- Запуск ----------
 async function start() {
   try {
-    // Ждём PostgreSQL
     await connectWithRetry(
       async () => { await sequelize.authenticate(); },
       'PostgreSQL'
     );
-    // force: false - не пересоздавать таблицу, если она уже есть
-    // sync() без параметров работает как "создать, если не существует"
     await UserSQL.sync();
+    // Добавляем колонку mongo_id если её нет
+    try {
+      await sequelize.getQueryInterface().addColumn('users', 'mongo_id', {
+        type: DataTypes.STRING,
+        allowNull: true
+      });
+    } catch (e) {
+      // Колонка уже существует
+    }
     console.log('PostgreSQL connected and synced');
 
-    // Ждём MongoDB
     await connectWithRetry(connectMongo, 'MongoDB');
     console.log('MongoDB connected');
 
-    // Ждём Redis
     await connectWithRetry(connectRedis, 'Redis');
     console.log('Redis connected');
 
-    // Запускаем сервер
     app.listen(PORT, '0.0.0.0', () => {
       console.log(`Server ${SERVER_ID} running on port ${PORT}`);
     });
